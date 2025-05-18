@@ -13,8 +13,7 @@ import numpy as np
 from pydicom import dcmread
 from pydicom.pixel_data_handlers.util import apply_voi_lut
 from pydicom.filebase import DicomBytesIO
-
-
+from ensemble_boxes import weighted_boxes_fusion
 # Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -35,13 +34,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load YOLO model
+# Load YOLO models for ensemble
 try:
-    model = YOLO("app/best.pt")
-    print("Model loaded successfully.")
+    model_paths = ["app/best.pt", "app/best2.pt", "app/best3.pt"]
+    models = []
+    
+    for model_path in model_paths:
+        try:
+            model = YOLO(model_path)
+            models.append(model)
+            print(f"Model {model_path} loaded successfully.")
+        except Exception as e:
+            print(f"Error loading {model_path}: {e}")
+    
+    if not models:
+        print("No models could be loaded.")
+        models = None
+    else:
+        print(f"Ensemble of {len(models)} models loaded successfully.")
+        
 except Exception as e:
-    model = None
-    print(f"Error loading best.pt: {e}")
+    models = None
+    print(f"Error loading models: {e}")
 
 
 class DicomProcessor:
@@ -104,9 +118,109 @@ def dicom_to_pil_image(dicom_bytes, target_size=(640, 640)):
     return pil_image
 
 
+def ensemble_predict_wbf_single_image(models, image, iou_threshold=0.5, confidence_threshold=0.25, skip_box_thr=0.0001):
+    """
+    Performs ensemble prediction using Weighted Box Fusion on multiple YOLO models for a single image.
+    
+    Returns fused detections and classification result
+    """
+    # Get predictions from each model
+    all_boxes = []
+    all_scores = []
+    all_classes = []
+    
+    # Store individual model results for detailed analysis
+    individual_results = []
+    
+    for i, model in enumerate(models):
+        try:
+            results = model.predict(image, conf=confidence_threshold, verbose=False)[0]
+            individual_results.append(results)
+            
+            if len(results.boxes) > 0:
+                # Get image dimensions
+                img_height, img_width = results.orig_shape[:2]
+                
+                # Extract boxes, scores and classes
+                # Convert to relative coordinates (0-1 range)
+                boxes = results.boxes.xyxy.cpu().numpy()
+                relative_boxes = boxes / np.array([img_width, img_height, img_width, img_height])
+                
+                all_boxes.append(relative_boxes.tolist())
+                all_scores.append(results.boxes.conf.cpu().numpy().tolist())
+                all_classes.append(results.boxes.cls.cpu().numpy().tolist())
+            else:
+                # Add empty lists if no detections
+                all_boxes.append([])
+                all_scores.append([])
+                all_classes.append([])
+                
+        except Exception as e:
+            print(f"Error in model {i}: {e}")
+            # Add empty lists on error
+            all_boxes.append([])
+            all_scores.append([])
+            all_classes.append([])
+    
+    # If no detections from any model
+    if all(len(boxes) == 0 for boxes in all_boxes):
+        return [], 1, individual_results  # 1 = no anomaly detected
+    
+    # Apply Weighted Box Fusion only if there are detections
+    try:
+        fused_boxes, fused_scores, fused_classes = weighted_boxes_fusion(
+            all_boxes, all_scores, all_classes, 
+            iou_thr=iou_threshold, 
+            skip_box_thr=skip_box_thr
+        )
+        
+        # Convert back to absolute coordinates if we have detections
+        if len(fused_boxes) > 0 and len(individual_results) > 0:
+            img_height, img_width = individual_results[0].orig_shape[:2]
+            fused_boxes = fused_boxes * np.array([img_width, img_height, img_width, img_height])
+        
+        # Create detection results in the expected format
+        detections = []
+        for i, (box, score, cls) in enumerate(zip(fused_boxes, fused_scores, fused_classes)):
+            detections.append({
+                "class": int(cls),
+                "confidence": round(float(score), 4),
+                "bbox_xyxy": [round(float(coord), 2) for coord in box],
+                "className": "anomaly" if int(cls) == 0 else "normal"
+            })
+        
+        # Determine classification: 0 = anomaly detected, 1 = no anomaly
+        classification_result = 0 if len(detections) > 0 else 1
+        
+        return detections, classification_result, individual_results
+        
+    except Exception as e:
+        print(f"Error in weighted box fusion: {e}")
+        # Fallback: return results from the first model that had detections
+        for results in individual_results:
+            if len(results.boxes) > 0:
+                detections = []
+                for box in results.boxes:
+                    cls = int(box.cls)
+                    conf = round(float(box.conf), 4)
+                    bbox = [round(c.item(), 2) for c in box.xyxy[0]]
+                    name = "anomaly" if cls == 0 else "normal"
+                    
+                    detections.append({
+                        "class": cls,
+                        "confidence": conf,
+                        "bbox_xyxy": bbox,
+                        "className": name
+                    })
+                return detections, 0, individual_results
+        
+        # If all fails, return no detections
+        return [], 1, individual_results
+
+
 @app.get("/")
 def raiz():
-    return {"message": "API By Edgar Garcia, Gabriela Bula, Lena Castillo"}
+    return {"message": "API By Edgar Garcia, Gabriela Bula, Lena Castillo - Ensemble Version"}
 
 
 @app.post("/predict/")
@@ -117,8 +231,8 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
 
     # If an image is uploaded, analyze it
     if file:
-        if not model:
-            return {"error": "Model not loaded. Please check the server logs."}
+        if not models:
+            return {"error": "Models not loaded. Please check the server logs."}
 
         content = await file.read()
         
@@ -139,37 +253,31 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
             except Exception as e:
                 return {"error": f"Image could not be loaded: {e}"}
 
-        # Run YOLO inference
+        # Run ensemble inference
         try:
-            results = model(image)
+            detections, class_label, individual_results = ensemble_predict_wbf_single_image(models, image)
         except Exception as e:
-            return {"error": f"Error in model inference: {e}"}
+            return {"error": f"Error in ensemble inference: {e}"}
 
-        detections = []
         # Create a copy for annotation
         annotated_image = image.copy()
         draw = ImageDraw.Draw(annotated_image)
-        res = results[0]
-        class_names = res.names
 
-        for box in res.boxes:
-            cls = int(box.cls)
-            conf = round(float(box.conf), 4)
-            bbox = [round(c.item(), 2) for c in box.xyxy[0]]
-            name = class_names[cls]
-
-            detections.append({
-                "class": cls,
-                "confidence": conf,
-                "bbox_xyxy": bbox,
-                "className": name
-            })
+        # Draw bounding boxes from ensemble results
+        for detection in detections:
+            bbox = detection["bbox_xyxy"]
+            conf = detection["confidence"]
+            name = detection["className"]
 
             # Draw bounding box
-            draw.rectangle(bbox, outline="red", width=2)
+            draw.rectangle(bbox, outline="red", width=3)
             label = f"{name} ({conf:.2f})"
             y_offset = bbox[1] - 15 if bbox[1] - 15 > 5 else bbox[1] + 5
             draw.text((bbox[0], y_offset), label, fill="red")
+
+        # Add ensemble info to the image
+        ensemble_text = f"Ensemble of {len(models)} models"
+        draw.text((10, 10), ensemble_text, fill="blue")
 
         # Encode annotated image
         buffer = io.BytesIO()
@@ -178,23 +286,23 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
 
         # Interpret detection results
         if detections:
-            class_label = detections[0]['class']
             if class_label == 0:
-                detection_result = "Anomalies were detected in the mammographic image."
-            elif class_label == 1:
-                detection_result = "No anomalies were detected in the mammographic image."
+                detection_result = f"Anomalies were detected in the mammographic image by the ensemble of {len(models)} models."
             else:
-                detection_result = "Detection result is unclear."
+                detection_result = f"No anomalies were detected in the mammographic image by the ensemble of {len(models)} models."
         else:
-            detection_result = "No objects were detected in the image."
+            detection_result = f"No objects were detected in the image by the ensemble of {len(models)} models."
 
         # Generate contextual explanation with OpenAI
         try:
+            # Include ensemble information in the context
+            ensemble_context = f"This result comes from an ensemble of {len(models)} YOLO models working together for improved accuracy. "
+            
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You are an expert in explaining mammography and medical imaging results."},
-                    {"role": "user", "content": f"{detection_result} Based on this result, please answer: {question}"}
+                    {"role": "system", "content": "You are an expert in explaining mammography and medical imaging results. You understand ensemble learning and how multiple models working together can provide more reliable results."},
+                    {"role": "user", "content": f"{ensemble_context}{detection_result} Based on this ensemble result, please answer: {question}"}
                 ],
                 max_tokens=500,
                 temperature=0.7
@@ -208,7 +316,12 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
             "annotated_image_base64": annotated_image_b64,
             "detection_result": detection_result,
             "explanation": explanation,
-            "file_type": "dicom" if file.filename.lower().endswith(('.dicom', '.dcm')) else "image"
+            "file_type": "dicom" if file.filename.lower().endswith(('.dicom', '.dcm')) else "image",
+            "ensemble_info": {
+                "models_used": len(models),
+                "model_paths": [path.split('/')[-1] for path in ["app/best.pt", "app/best2.pt", "app/best3.pt"] if models],
+                "fusion_method": "Weighted Box Fusion"
+            }
         }
 
     # If no image uploaded, answer general question
@@ -217,7 +330,7 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You are a medical assistant knowledgeable in mammographic anomaly detection."},
+                    {"role": "system", "content": "You are a medical assistant knowledgeable in mammographic anomaly detection and ensemble learning methods."},
                     {"role": "user", "content": question}
                 ],
                 max_tokens=500,
@@ -227,7 +340,13 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
         except Exception as e:
             answer = f"Error generating response from OpenAI: {e}"
 
-        return {"response": answer}
+        return {
+            "response": answer,
+            "ensemble_info": {
+                "models_available": len(models) if models else 0,
+                "fusion_method": "Weighted Box Fusion"
+            }
+        }
 
 
 

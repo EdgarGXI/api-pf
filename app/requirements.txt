@@ -6,3 +6,4 @@ python-dotenv
 openai
 pydantic
 pydicom
+ensemble_boxes

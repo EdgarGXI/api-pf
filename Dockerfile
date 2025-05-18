@@ -9,6 +9,8 @@ COPY ./app/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ./app/best.pt ./best.pt
+COPY ./app/best2.pt ./best2.pt
+COPY ./app/best3.pt ./best3.pt
 # Copy the rest of the code
 COPY ./app /usr/src/app/app
 
