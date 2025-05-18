@@ -2,3 +2,7 @@ fastapi
 uvicorn[standard]
 Pillow
 python-multipart
+python-dotenv
+openai
+pydantic
+pydicom
