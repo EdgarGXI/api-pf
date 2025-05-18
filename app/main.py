@@ -220,7 +220,7 @@ def ensemble_predict_wbf_single_image(models, image, iou_threshold=0.5, confiden
 
 @app.get("/")
 def raiz():
-    return {"message": "API By Edgar Garcia, Gabriela Bula, Lena Castillo - Ensemble Version"}
+    return {"message": "API By Edgar Garcia, Gabriela Bula, Lena Castillo"}
 
 
 @app.post("/predict/")
@@ -275,9 +275,6 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
             y_offset = bbox[1] - 15 if bbox[1] - 15 > 5 else bbox[1] + 5
             draw.text((bbox[0], y_offset), label, fill="red")
 
-        # Add ensemble info to the image
-        ensemble_text = f"Ensemble of {len(models)} models"
-        draw.text((10, 10), ensemble_text, fill="blue")
 
         # Encode annotated image
         buffer = io.BytesIO()
