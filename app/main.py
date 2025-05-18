@@ -287,25 +287,25 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
         # Interpret detection results
         if detections:
             if class_label == 0:
-                detection_result = f"Anomalies were detected in the mammographic image by the ensemble of {len(models)} models."
+                detection_result = f"Anomalies were detected in the mammographic image"
             else:
-                detection_result = f"No anomalies were detected in the mammographic image by the ensemble of {len(models)} models."
+                detection_result = f"No anomalies were detected in the mammographic image"
         else:
-            detection_result = f"No objects were detected in the image by the ensemble of {len(models)} models."
+            detection_result = f"No objects were detected in the image"
 
         # Generate contextual explanation with OpenAI
         try:
             # Include ensemble information in the context
-            ensemble_context = f"This result comes from an ensemble of {len(models)} YOLO models working together for improved accuracy. "
+
             
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You are an expert in explaining mammography and medical imaging results. You understand ensemble learning and how multiple models working together can provide more reliable results."},
-                    {"role": "user", "content": f"{ensemble_context}{detection_result} Based on this ensemble result, please answer: {question}"}
+                    {"role": "system", "content": "You are an expert in explaining mammography and medical imaging results. You understand machine learning"},
+                    {"role": "user", "content": f"{detection_result} Based on this result, please answer: {question}"}
                 ],
                 max_tokens=500,
-                temperature=0.7
+                temperature=0.5
             )
             explanation = response.choices[0].message.content
         except Exception as e:
