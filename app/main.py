@@ -14,6 +14,9 @@ from pydicom import dcmread
 from pydicom.pixel_data_handlers.util import apply_voi_lut
 from pydicom.filebase import DicomBytesIO
 from ensemble_boxes import weighted_boxes_fusion
+import uuid
+from typing import Dict, List, Optional
+from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
@@ -42,6 +45,68 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Session storage for conversation history
+# En producción, usa Redis o una base de datos
+conversation_sessions: Dict[str, List[Dict]] = {}
+
+class ConversationMessage(BaseModel):
+    role: str
+    content: str
+
+def get_system_prompt():
+    return """You are an expert in explaining mammography and medical imaging results, with a deep understanding of machine learning, specifically concerning the diagnosis of breast cancer. You are familiar with a final project from Universidad del Norte titled 'Modelo de inteligencia artificial para el diagnóstico asistido del cáncer de mama: Un enfoque basado en redes neuronales'. 
+
+This project aimed to develop and implement an AI application based on the YOLO (You Only Look Once) architecture for the early detection of breast cancer. The justification for the project includes the high global prevalence and mortality of breast cancer, the significant percentage of misclassified mammograms due to human factors (interpretation and image search errors), and deficiencies in mammography quality in regions like Colombia.
+
+The AI model specifically uses the YOLOv8 architecture, chosen for its real-time object detection capabilities with Convolutional Neural Networks (CNNs). YOLOv8's architecture consists of an input layer (processing 640x640x3 pixel images), a Backbone (CSPDarknet53, capturing multi-scale features using kernels, strides, and padding, notably 3x3 kernels and stride 2 for progressive feature map reduction, and incorporating C2f blocks and an SPPF module), a Neck (using PANet for multi-scale information flow optimization and replacing FPN with C2f modules), and a Head (generating bounding boxes and confidence scores). The detection block uses 4xreg_max parameterization for bounding box regression and a classification module, optimized with CIoU and Distribution Focal Loss (DFL).
+
+The project utilized the VinDr-Mammo dataset, a large-scale public dataset of 5,000 four-view digital mammography exams with BI-RADS assessments and finding annotations (masses, calcifications, nodes), including breast-level_annotations.csv and finding_annotations.csv. From this, 1659 cases were selected (1363 with masses/calcifications BI-RADS > 3, and 296 normal cases) to create a less imbalanced dataset (85% anomalous, 15% normal).
+
+Methodology involved several stages: 
+1. Data Exploration: Review of literature and selection of VinDr-Mammo.
+2. Preprocessing: Conversion of DICOM files to PNG. Application of advanced image processing techniques including segmentation with CLAHE filters to improve contrast, standardization of intensities, correction of negative coordinates in bounding boxes (to 0) and those exceeding image dimensions (to max allowed), and conversion of bounding box coordinates to YOLO format (normalized x_center, y_center, width, height). Images were resized to 640x640 pixels and converted from MONOCHROME1 to MONOCHROME2.
+3. Data Augmentation: Generation of three augmented versions per image using horizontal flips, vertical flips, and 90-degree rotations with Albumentations.
+4. Hyperparameter Tuning (Tuning): Initial reduced training (20 epochs, 50 iterations) using Optuna to estimate hyperparameters like initial learning rate (lr0), final learning rate factor (lrf), SGD momentum, L2 regularization (weight_decay), warmup epochs, warmup momentum, bounding box loss weight (box), and classification loss weight (cls).
+5. Model Training and Validation: The YOLOv8-L model was trained for 128 epochs using PyTorch and an NVIDIA RTX A5000 GPU. The dataset was split into training (70%), validation (15%), and testing (15%) using stratified division based on laterality, view_position, breast_density, and finding_categories.
+
+Key results from the validation included a confusion matrix with 783 True Positives (VP), 325 True Negatives (VN), 348 False Positives (FP), and 29 False Negatives (FN). Performance metrics showed: 
+- Precision: 96% for anomalies (class 0), 48% for normal tissue (class 1).
+- Sensitivity (Recall): 69% for anomalies (class 0), 92% for normal tissue (class 1).
+- F1-Score: 79% for anomalies (class 0), 60% for normal tissue (class 1).
+- Overall Accuracy: 72%.
+- Localization Performance: mAP50 (mean Average Precision at IoU 0.5) of 52%, and mAP50-95 (mAP averaged over IoU thresholds from 0.5 to 0.95) of 31%.
+
+The project also involved developing a prototype with a React frontend (deployed via GitHub Pages). The user interface included a Chatbot for queries and a Dashboard for visualizing metrics.
+
+You should be prepared to answer questions about these project specifics, the general concepts of Deep Learning (multi-layered neural networks emulating human decision-making), Convolutional Neural Networks (specialized for image processing using matrix multiplication), Mammography (X-ray of the breast for screening, detecting tumors and microcalcifications), Neoplasia (uncontrolled growth of abnormal cells), different YOLOv8 versions (n, s, m, l, x), and the role of AI in improving diagnostic accuracy and speed in medical imaging, particularly in breast cancer detection by identifying and localizing suspicious areas with bounding boxes and confidence scores, and understanding the BI-RADS classification system. Acknowledge that AI tools are for decision support and do not replace specialized medical judgment."""
+
+def add_message_to_session(session_id: str, role: str, content: str):
+    """Añade un mensaje al historial de la sesión"""
+    if session_id not in conversation_sessions:
+        conversation_sessions[session_id] = [
+            {"role": "system", "content": get_system_prompt()}
+        ]
+    
+    conversation_sessions[session_id].append({
+        "role": role,
+        "content": content
+    })
+    
+    # Limitar el historial a los últimos 20 mensajes (más el sistema)
+    if len(conversation_sessions[session_id]) > 21:
+        # Mantener el mensaje del sistema y los últimos 20 mensajes
+        system_msg = conversation_sessions[session_id][0]
+        recent_messages = conversation_sessions[session_id][-20:]
+        conversation_sessions[session_id] = [system_msg] + recent_messages
+
+def get_session_messages(session_id: str) -> List[Dict]:
+    """Obtiene el historial de mensajes de una sesión"""
+    if session_id not in conversation_sessions:
+        conversation_sessions[session_id] = [
+            {"role": "system", "content": get_system_prompt()}
+        ]
+    return conversation_sessions[session_id]
 
 # Load YOLO models for ensemble
 try:
@@ -251,9 +316,46 @@ def ensemble_predict_wbf_single_image(
 def raiz():
     return {"message": "API By Edgar Garcia, Gabriela Bula, Lena Castillo"}
 
+@app.post("/new_session/")
+def create_new_session():
+    """Crea una nueva sesión de conversación"""
+    session_id = str(uuid.uuid4())
+    conversation_sessions[session_id] = [
+        {"role": "system", "content": get_system_prompt()}
+    ]
+    return {"session_id": session_id}
+
+@app.get("/sessions/{session_id}/messages/")
+def get_session_history(session_id: str):
+    """Obtiene el historial de mensajes de una sesión (excluyendo el mensaje del sistema)"""
+    messages = get_session_messages(session_id)
+    # Filtrar el mensaje del sistema para el frontend
+    user_messages = [msg for msg in messages if msg["role"] != "system"]
+    return {"messages": user_messages}
+
+@app.delete("/sessions/{session_id}/")
+def clear_session(session_id: str):
+    """Limpia el historial de una sesión"""
+    if session_id in conversation_sessions:
+        conversation_sessions[session_id] = [
+            {"role": "system", "content": get_system_prompt()}
+        ]
+        return {"message": "Session cleared successfully"}
+    return {"message": "Session not found"}
 
 @app.post("/predict/")
-async def predict(file: UploadFile = File(None), question: str = Form(...)):
+async def predict(
+    file: UploadFile = File(None), 
+    question: str = Form(...),
+    session_id: str = Form(None)
+):
+    # Si no se proporciona session_id, crear uno nuevo
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        conversation_sessions[session_id] = [
+            {"role": "system", "content": get_system_prompt()}
+        ]
+    
     annotated_image_b64 = None
     detection_result = None
     class_label = None
@@ -330,71 +432,38 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
         else:
             detection_result = f"No objects were detected in the image"
 
+        # Añadir mensaje del usuario con contexto de imagen
+        user_message = f"[Image uploaded: {file.filename}] {question}" if question else f"[Image uploaded: {file.filename}] Please analyze this mammogram."
+        add_message_to_session(session_id, "user", user_message)
+
+        # Preparar mensaje específico para la API con contexto de detección
+        context_message = f"Regarding: {detection_result} Based on this result with confidence {confidence_str}, please answer: {question}"
+        
+        # Obtener historial de la sesión
+        session_messages = get_session_messages(session_id)
+        
+        # Reemplazar el último mensaje del usuario con el contexto específico para la API
+        api_messages = session_messages.copy()
+        api_messages[-1] = {"role": "user", "content": context_message}
+
         # Generate contextual explanation with OpenAI
         try:
-
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
-                messages=[
-                    {
-                        "role": "system",
-                        "content":
-                            "You are an expert in explaining mammography and medical imaging results, with a deep understanding of machine learning, "
-                            "specifically concerning the diagnosis of breast cancer. You are familiar with a final project from Universidad del Norte titled "
-                            "'Modelo de inteligencia artificial para el diagnóstico asistido del cáncer de mama: Un enfoque basado en redes neuronales'. "
-                            "This project aimed to develop and implement an AI application based on the YOLO (You Only Look Once) architecture for the early "
-                            "detection of breast cancer. The justification for the project includes the high global prevalence and mortality of breast cancer, "
-                            "the significant percentage of misclassified mammograms due to human factors (interpretation and image search errors), and deficiencies "
-                            "in mammography quality in regions like Colombia.\n\n"
-                            "The AI model specifically uses the YOLOv8 architecture, chosen for its real-time object detection capabilities with Convolutional Neural Networks (CNNs). "
-                            "YOLOv8's architecture consists of an input layer (processing 640x640x3 pixel images), a Backbone (CSPDarknet53, capturing multi-scale features using "
-                            "kernels, strides, and padding, notably 3x3 kernels and stride 2 for progressive feature map reduction, and incorporating C2f blocks and an SPPF module), "
-                            "a Neck (using PANet for multi-scale information flow optimization and replacing FPN with C2f modules), and a Head (generating bounding boxes "
-                            "and confidence scores). The detection block uses 4xreg_max parameterization for bounding box regression and a classification module, "
-                            "optimized with CIoU and Distribution Focal Loss (DFL).\n\n"
-                            "The project utilized the VinDr-Mammo dataset, a large-scale public dataset of 5,000 four-view digital mammography exams with BI-RADS assessments and "
-                            "finding annotations (masses, calcifications, nodes), including breast-level_annotations.csv and finding_annotations.csv. "
-                            "From this, 1659 cases were selected (1363 with masses/calcifications BI-RADS > 3, and 296 normal cases) to create a less imbalanced dataset (85% anomalous, 15% normal).\n\n"
-                            "Methodology involved several stages: \n"
-                            "1. Data Exploration: Review of literature and selection of VinDr-Mammo.\n"
-                            "2. Preprocessing: Conversion of DICOM files to PNG. Application of advanced image processing techniques including segmentation with CLAHE filters to improve contrast, "
-                            "standardization of intensities, correction of negative coordinates in bounding boxes (to 0) and those exceeding image dimensions (to max allowed), "
-                            "and conversion of bounding box coordinates to YOLO format (normalized x_center, y_center, width, height). Images were resized to 640x640 pixels and "
-                            "converted from MONOCHROME1 to MONOCHROME2.\n"
-                            "3. Data Augmentation: Generation of three augmented versions per image using horizontal flips, vertical flips, and 90-degree rotations with Albumentations.\n"
-                            "4. Hyperparameter Tuning (Tuning): Initial reduced training (20 epochs, 50 iterations) using Optuna to estimate hyperparameters like initial learning rate (lr0), "
-                            "final learning rate factor (lrf), SGD momentum, L2 regularization (weight_decay), warmup epochs, warmup momentum, bounding box loss weight (box), and classification loss weight (cls).\n"
-                            "5. Model Training and Validation: The YOLOv8-L model was trained for 128 epochs using PyTorch and an NVIDIA RTX A5000 GPU. "
-                            "The dataset was split into training (70%), validation (15%), and testing (15%) using stratified division based on laterality, view_position, breast_density, and finding_categories.\n\n"
-                            "Key results from the validation included a confusion matrix with 783 True Positives (VP), 325 True Negatives (VN), 348 False Positives (FP), and 29 False Negatives (FN). "
-                            "Performance metrics showed: \n"
-                            "- Precision: 96% for anomalies (class 0), 48% for normal tissue (class 1).\n"
-                            "- Sensitivity (Recall): 73% for anomalies (class 0), 92% for normal tissue (class 1).\n"
-                            "- F1-Score: 83% for anomalies (class 0), 60% for normal tissue (class 1).\n"
-                            "- Overall Accuracy: 74%.\n"
-                            "- Localization Performance: mAP50 (mean Average Precision at IoU 0.5) of 52%, and mAP50-95 (mAP averaged over IoU thresholds from 0.5 to 0.95) of 31%.\n\n"
-                            "The project also involved developing a prototype with a React frontend (deployed via GitHub Pages). "
-                            "The user interface included a Chatbot for queries and a Dashboard for visualizing metrics.\n\n"
-                            "You should be prepared to answer questions about these project specifics, the general concepts of Deep Learning (multi-layered neural networks emulating human decision-making), "
-                            "Convolutional Neural Networks (specialized for image processing using matrix multiplication), Mammography (X-ray of the breast for screening, detecting tumors and microcalcifications), "
-                            "Neoplasia (uncontrolled growth of abnormal cells), different YOLOv8 versions (n, s, m, l, x), and the role of AI in improving diagnostic accuracy and speed in medical imaging, "
-                            "particularly in breast cancer detection by identifying and localizing suspicious areas with bounding boxes and confidence scores, and understanding the BI-RADS classification system. "
-                            "Acknowledge that AI tools are for decision support and do not replace specialized medical judgment."
-                        ,
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Regarding: {detection_result} Based on this result with this confidence {confidence_str}, please answer: {question}",
-                    },
-                ],
+                messages=api_messages,
                 max_tokens=500,
                 temperature=0.2,
             )
             explanation = response.choices[0].message.content
+            
+            # Añadir respuesta del asistente al historial
+            add_message_to_session(session_id, "assistant", explanation)
+            
         except Exception as e:
             explanation = f"Error generating explanation: {e}"
 
         return {
+            "session_id": session_id,
             "results": detections,
             "annotated_image_base64": annotated_image_b64,
             "detection_result": detection_result,
@@ -417,64 +486,29 @@ async def predict(file: UploadFile = File(None), question: str = Form(...)):
 
     # If no image uploaded, answer general question
     else:
+        # Añadir pregunta del usuario al historial
+        add_message_to_session(session_id, "user", question)
+        
+        # Obtener historial completo para el contexto
+        session_messages = get_session_messages(session_id)
+        
         try:
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert in explaining mammography and medical imaging results, with a deep understanding of machine learning, "
-                            "specifically concerning the diagnosis of breast cancer. You are familiar with a final project from Universidad del Norte titled "
-                            "'Modelo de inteligencia artificial para el diagnóstico asistido del cáncer de mama: Un enfoque basado en redes neuronales'. "
-                            "This project aimed to develop and implement an AI application based on the YOLO (You Only Look Once) architecture for the early "
-                            "detection of breast cancer. The justification for the project includes the high global prevalence and mortality of breast cancer, "
-                            "the significant percentage of misclassified mammograms due to human factors (interpretation and image search errors), and deficiencies "
-                            "in mammography quality in regions like Colombia.\n\n"
-                            "The AI model specifically uses the YOLOv8 architecture, chosen for its real-time object detection capabilities with Convolutional Neural Networks (CNNs). "
-                            "YOLOv8's architecture consists of an input layer (processing 640x640x3 pixel images), a Backbone (CSPDarknet53, capturing multi-scale features using "
-                            "kernels, strides, and padding, notably 3x3 kernels and stride 2 for progressive feature map reduction, and incorporating C2f blocks and an SPPF module), "
-                            "a Neck (using PANet for multi-scale information flow optimization and replacing FPN with C2f modules), and a Head (generating bounding boxes "
-                            "and confidence scores). The detection block uses 4xreg_max parameterization for bounding box regression and a classification module, "
-                            "optimized with CIoU and Distribution Focal Loss (DFL).\n\n"
-                            "The project utilized the VinDr-Mammo dataset, a large-scale public dataset of 5,000 four-view digital mammography exams with BI-RADS assessments and "
-                            "finding annotations (masses, calcifications, nodes), including breast-level_annotations.csv and finding_annotations.csv. "
-                            "From this, 1659 cases were selected (1363 with masses/calcifications BI-RADS > 3, and 296 normal cases) to create a less imbalanced dataset (85% anomalous, 15% normal).\n\n"
-                            "Methodology involved several stages: \n"
-                            "1. Data Exploration: Review of literature and selection of VinDr-Mammo.\n"
-                            "2. Preprocessing: Conversion of DICOM files to PNG. Application of advanced image processing techniques including segmentation with CLAHE filters to improve contrast, "
-                            "standardization of intensities, correction of negative coordinates in bounding boxes (to 0) and those exceeding image dimensions (to max allowed), "
-                            "and conversion of bounding box coordinates to YOLO format (normalized x_center, y_center, width, height). Images were resized to 640x640 pixels and "
-                            "converted from MONOCHROME1 to MONOCHROME2.\n"
-                            "3. Data Augmentation: Generation of three augmented versions per image using horizontal flips, vertical flips, and 90-degree rotations with Albumentations.\n"
-                            "4. Hyperparameter Tuning (Tuning): Initial reduced training (20 epochs, 50 iterations) using Optuna to estimate hyperparameters like initial learning rate (lr0), "
-                            "final learning rate factor (lrf), SGD momentum, L2 regularization (weight_decay), warmup epochs, warmup momentum, bounding box loss weight (box), and classification loss weight (cls).\n"
-                            "5. Model Training and Validation: The YOLOv8-L model was trained for 128 epochs using PyTorch and an NVIDIA RTX A5000 GPU. "
-                            "The dataset was split into training (70%), validation (15%), and testing (15%) using stratified division based on laterality, view_position, breast_density, and finding_categories.\n\n"
-                            "Key results from the validation included a confusion matrix with 783 True Positives (VP), 325 True Negatives (VN), 348 False Positives (FP), and 29 False Negatives (FN). "
-                            "Performance metrics showed: \n"
-                            "- Precision: 96% for anomalies (class 0), 48% for normal tissue (class 1).\n"
-                            "- Sensitivity (Recall): 69% for anomalies (class 0), 92% for normal tissue (class 1).\n"
-                            "- F1-Score: 79% for anomalies (class 0), 60% for normal tissue (class 1).\n"
-                            "- Overall Accuracy: 72%.\n"
-                            "- Localization Performance: mAP50 (mean Average Precision at IoU 0.5) of 52%, and mAP50-95 (mAP averaged over IoU thresholds from 0.5 to 0.95) of 31%.\n\n"
-                            "The project also involved developing a prototype with a React frontend (deployed via GitHub Pages). "
-                            "The user interface included a Chatbot for queries and a Dashboard for visualizing metrics.\n\n"
-                            "You should be prepared to answer questions about these project specifics, the general concepts of Deep Learning (multi-layered neural networks emulating human decision-making), "
-                            "Convolutional Neural Networks (specialized for image processing using matrix multiplication), Mammography (X-ray of the breast for screening, detecting tumors and microcalcifications), "
-                            "Neoplasia (uncontrolled growth of abnormal cells), different YOLOv8 versions (n, s, m, l, x), and the role of AI in improving diagnostic accuracy and speed in medical imaging, "
-                            "particularly in breast cancer detection by identifying and localizing suspicious areas with bounding boxes and confidence scores, and understanding the BI-RADS classification system. "
-                            "Acknowledge that AI tools are for decision support and do not replace specialized medical judgment.",
-                    },
-                    {"role": "user", "content": question},
-                ],
+                messages=session_messages,
                 max_tokens=500,
                 temperature=0.7,
             )
             answer = response.choices[0].message.content
+            
+            # Añadir respuesta del asistente al historial
+            add_message_to_session(session_id, "assistant", answer)
+            
         except Exception as e:
             answer = f"Error generating response from OpenAI: {e}"
 
         return {
+            "session_id": session_id,
             "response": answer,
             "ensemble_info": {
                 "models_available": len(models) if models else 0,
